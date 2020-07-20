@@ -1,0 +1,137 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(warning = FALSE,
+                      message = FALSE)
+```
+
+
+
+```{r}
+library(tidyverse)
+library(janitor)
+library(lubridate)
+library(sf)
+library(geojsonsf)
+library(tidymodels)
+
+moving_violations <- read_csv("https://opendata.arcgis.com/datasets/c3e91eed970149e6a41853ddadf36394_1.csv") %>%
+  clean_names()
+```
+
+```{r}
+mv_clean <- moving_violations %>%
+  transmute(objectid, 
+            plate_state, 
+            fine_amount,
+            latitude,
+            longitude) %>%
+  #10,000 removed
+  filter(!is.na(latitude) & !is.na(longitude)) %>%
+  st_as_sf(coords = c("longitude", "latitude"),
+           crs = 4326) %>%
+  st_transform(crs = 2248)
+
+#visual test - are we plotting in DC? i.e. did i miss up lat/lon
+mv_clean %>% sample_n(10) %>% mapview::mapview()
+
+```
+
+```{r}
+
+opendatadc_geojson <- "https://opendata.arcgis.com/datasets/0ef47379cbae44e88267c01eaec2ff6e_31.geojson"
+
+dc_wards <- geojson_sf(opendatadc_geojson)
+
+```
+
+```{r}
+
+dc_wards_clean <- dc_wards %>%
+  clean_names() %>%
+  as_tibble() %>%
+  st_as_sf() %>%
+  st_transform(crs = 2248) %>%
+  select(sort(names(.)))
+
+dc_ward_geometry_only <- dc_wards_clean %>%
+  select(ward_id, geometry)
+
+mv_wards <- mv_clean %>%
+  st_join(dc_ward_geometry_only) %>%
+  st_drop_geometry()
+
+```
+
+```{r}
+set.seed(7000) #this is a 7000 series train
+
+mv_spec <- linear_reg() %>%
+  set_engine("lm")
+
+mv_recipe <- recipe(fine_amount ~ ., data = mv_wards) %>%
+  update_role(objectid, new_role = "id") %>%
+  step_other(plate_state) %>%
+  step_dummy(all_nominal())
+
+mv_recipe %>% prep() %>% juice()
+
+```
+
+
+```{r}
+
+mv_workflow <- workflow() %>%
+  add_recipe(mv_recipe) %>%
+  add_model(mv_spec)
+
+mv_wf_fit <- mv_workflow %>%
+  fit(mv_wards)
+
+```
+
+```{r}
+mv_wf_fit %>%
+  tidy()
+
+```
+
+### Visualization
+
+```{r}
+new_mv <- crossing(
+  objectid = 00000000,
+  plate_state = "Other",
+  ward_id = 1:8,
+) %>%
+  mutate(ward_id = as.character(ward_id))
+
+predictions <- predict(mv_wf_fit,
+        new_data = new_mv)
+
+conf_int_pred <- predict(mv_wf_fit,
+  new_data = new_mv,
+  type = "conf_int"
+)
+
+bind_cols(new_mv, predictions, conf_int_pred) %>%
+  mutate(ward_id = paste("Ward", ward_id),
+    ward_id = fct_reorder(ward_id, .pred)) %>%
+  ggplot(aes(ward_id, .pred, color = ward_id)) +
+  geom_point(size = 3.5) +
+  geom_errorbar(aes(
+    ymin = .pred_lower,
+    ymax = .pred_upper
+  ),
+  width = 0.2, alpha = 0.7
+  ) +
+  scale_y_continuous(labels = scales::dollar_format(accuracy = 1)) +
+  labs(x = NULL,
+       y = "Predicted Moving Violation Fine") + 
+  theme(legend.position = "none")
+
+
+```

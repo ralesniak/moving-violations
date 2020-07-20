@@ -1,0 +1,101 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(warning = FALSE,
+                      message = FALSE)
+```
+
+
+
+```{r}
+library(tidyverse)
+library(janitor)
+library(lubridate)
+library(sf)
+library(geojsonsf)
+library(tidymodels)
+
+moving_violations <- read_csv("https://opendata.arcgis.com/datasets/c3e91eed970149e6a41853ddadf36394_1.csv") %>%
+  clean_names()
+```
+
+
+```{r, echo = FALSE}
+mv_clean <- moving_violations %>%
+  select(objectid, 
+            violation_process_desc,
+            latitude,
+            longitude) %>%
+  #10,000 removed
+  filter(!is.na(latitude) & !is.na(longitude)) %>%
+  st_as_sf(coords = c("longitude", "latitude"),
+           crs = 4326) %>%
+  st_transform(crs = 2248)
+
+```
+
+```{r}
+
+opendatadc_geojson <- "https://opendata.arcgis.com/datasets/0ef47379cbae44e88267c01eaec2ff6e_31.geojson"
+
+dc_wards <- geojson_sf(opendatadc_geojson)
+
+```
+
+```{r}
+
+dc_wards_clean <- dc_wards %>%
+  clean_names() %>%
+  as_tibble() %>%
+  st_as_sf() %>%
+  st_transform(crs = 2248) %>%
+  select(sort(names(.)))
+
+dc_ward_geometry_only <- dc_wards_clean %>%
+ select(ward_id, geometry)
+
+mv_wards <- mv_clean %>%
+  st_join(dc_ward_geometry_only) %>%
+  st_drop_geometry() %>%
+  filter(!is.na(ward_id)) %>%
+  mutate(is_ward_1 = if_else(ward_id == "1", TRUE, FALSE))
+
+```
+
+```{r}
+set.seed(7000) #this is a 7000 series train
+
+mv_spec <- linear_reg() %>%
+  set_engine("lm")
+
+mv_recipe <- recipe(is_ward_1 ~ ., data = mv_wards) %>%
+  step_downsample(ward_id) %>%
+  update_role(objectid, ward_id, new_role = "id") %>%
+  step_other(violation_process_desc, threshold = 0.01) %>%
+  step_dummy(all_nominal(), -all_outcomes(), -has_role("id"))
+
+mv_recipe %>% prep() %>% juice()
+
+```
+
+
+```{r}
+
+mv_workflow <- workflow() %>%
+  add_recipe(mv_recipe) %>%
+  add_model(mv_spec)
+
+mv_wf_fit <- mv_workflow %>%
+  fit(mv_wards)
+
+```
+
+```{r}
+mv_wf_fit %>%
+  tidy() %>%
+  filter(p.value < 0.05)
+
+```
